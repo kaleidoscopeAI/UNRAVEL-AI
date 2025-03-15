@@ -1,0 +1,1884 @@
+    def start_tracking(self, license_info: LicenseInfo, container_id: Optional[str] = None) -> bool:
+        """
+        Start tracking usage for an app
+        
+        Args:
+            license_info: License information
+            container_id: Optional Docker container ID
+            
+        Returns:
+            Success status
+        """
+        app_id = license_info.app_id
+        license_id = license_info.license_id
+        
+        # Check if already tracking
+        if license_id in self.tracking_threads and self.tracking_threads[license_id].is_alive():
+            logger.info(f"Already tracking usage for license {license_id}")
+            return True
+        
+        # Start tracking thread
+        thread = threading.Thread(
+            target=self._tracking_loop,
+            args=(license_info, container_id),
+            daemon=True
+        )
+        thread.start()
+        
+        # Store thread reference
+        self.tracking_threads[license_id] = thread
+        
+        logger.info(f"Started usage tracking for license {license_id}")
+        return True
+    
+    def stop_tracking(self, license_id: str) -> bool:
+        """
+        Stop tracking usage for an app
+        
+        Args:
+            license_id: License ID
+            
+        Returns:
+            Success status
+        """
+        if license_id not in self.tracking_threads:
+            logger.warning(f"Not tracking usage for license {license_id}")
+            return False
+        
+        # Remove thread reference (it will exit on its own)
+        thread = self.tracking_threads.pop(license_id)
+        
+        logger.info(f"Stopped usage tracking for license {license_id}")
+        return True
+    
+    def _tracking_loop(self, license_info: LicenseInfo, container_id: Optional[str] = None) -> None:
+        """
+        Usage tracking loop
+        
+        Args:
+            license_info: License information
+            container_id: Optional Docker container ID
+        """
+        app_id = license_info.app_id
+        license_id = license_info.license_id
+        
+        # Create initial metrics
+        metrics = UsageMetrics(
+            app_id=app_id,
+            license_id=license_id,
+            start_time=time.time()
+        )
+        
+        while True:
+            try:
+                # Update metrics
+                self._update_metrics(metrics, container_id)
+                
+                # Save metrics to database
+                self.db_manager.save_usage_metrics(metrics)
+                
+                # Wait for next update
+                time.sleep(self.interval)
+                
+                # Check if we should stop tracking
+                if license_id not in self.tracking_threads:
+                    logger.info(f"Tracking stopped for license {license_id}")
+                    break
+                
+            except Exception as e:
+                logger.error(f"Error tracking usage: {str(e)}")
+                time.sleep(self.interval)
+    
+    def _update_metrics(self, metrics: UsageMetrics, container_id: Optional[str] = None) -> None:
+        """
+        Update usage metrics
+        
+        Args:
+            metrics: Usage metrics to update
+            container_id: Optional Docker container ID
+        """
+        # Update timestamp
+        metrics.last_update = time.time()
+        
+        # If container ID is provided and Docker client is available, get container metrics
+        if container_id and self.docker_client:
+            try:
+                container = self.docker_client.containers.get(container_id)
+                
+                # Get container stats
+                stats = container.stats(stream=False)
+                
+                # Update CPU usage (convert to seconds)
+                cpu_stats = stats.get('cpu_stats', {})
+                precpu_stats = stats.get('precpu_stats', {})
+                
+                cpu_delta = cpu_stats.get('cpu_usage', {}).get('total_usage', 0) - \
+                           precpu_stats.get('cpu_usage', {}).get('total_usage', 0)
+                           
+                system_delta = cpu_stats.get('system_cpu_usage', 0) - \
+                               precpu_stats.get('system_cpu_usage', 0)
+                               
+                if system_delta > 0 and cpu_delta > 0:
+                    cpu_percent = (cpu_delta / system_delta) * 100.0
+                    metrics.cpu_time += (cpu_percent / 100.0) * (self.interval / 3600.0)  # Convert to CPU hours
+                
+                # Update memory usage (in MB)
+                memory_stats = stats.get('memory_stats', {})
+                memory_usage = memory_stats.get('usage', 0) / (1024 * 1024)  # Convert to MB
+                metrics.memory_usage = max(metrics.memory_usage, memory_usage)
+                
+                # Update storage usage if available
+                if 'blkio_stats' in stats:
+                    blkio_stats = stats.get('blkio_stats', {})
+                    io_service_bytes_recursive = blkio_stats.get('io_service_bytes_recursive', [])
+                    for io_stat in io_service_bytes_recursive:
+                        if io_stat.get('op') == 'Write':
+                            metrics.storage_usage = max(
+                                metrics.storage_usage,
+                                io_stat.get('value', 0) / (1024 * 1024)  # Convert to MB
+                            )
+            except Exception as e:
+                logger.error(f"Error getting container metrics: {str(e)}")
+        
+        # Make small regular increments to API calls for simulation
+        # In a real implementation, this would be based on actual API usage
+        metrics.api_calls += 1
+
+class RevenueTracker:
+    """Tracks revenue and profit for profit sharing"""
+    
+    def __init__(self):
+        """Initialize the revenue tracker"""
+        self.db_manager = DatabaseManager()
+    
+    def report_revenue(
+        self, 
+        license_id: str, 
+        revenue: float, 
+        profit: Optional[float] = None,
+        transaction_count: int = 1,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Report revenue for an app
+        
+        Args:
+            license_id: License ID
+            revenue: Revenue amount
+            profit: Optional profit amount (estimated if not provided)
+            transaction_count: Number of transactions
+            metadata: Optional metadata
+            
+        Returns:
+            Success status
+        """
+        try:
+            # Get license info
+            license_result = self.db_manager.get_license(license_id)
+            if not license_result:
+                logger.error(f"License {license_id} not found")
+                return False
+            
+            license_info, _ = license_result
+            
+            # Estimate profit if not provided (default to 20% of revenue)
+            if profit is None:
+                profit = revenue * 0.2
+            
+            # Create or update usage metrics
+            metrics_list = self.db_manager.get_usage_metrics(license_id, days=1)
+            
+            if metrics_list:
+                # Update existing metrics from today
+                metrics = metrics_list[-1]
+                metrics.revenue += revenue
+                metrics.profit += profit
+                metrics.transaction_volume += transaction_count
+                metrics.last_update = time.time()
+                
+                if metadata:
+                    metrics.metadata.update(metadata)
+            else:
+                # Create new metrics
+                metrics = UsageMetrics(
+                    app_id=license_info.app_id,
+                    license_id=license_id,
+                    start_time=time.time(),
+                    revenue=revenue,
+                    profit=profit,
+                    transaction_volume=transaction_count,
+                    last_update=time.time(),
+                    metadata=metadata or {}
+                )
+            
+            # Save metrics
+            self.db_manager.save_usage_metrics(metrics)
+            
+            # Calculate profit share
+            profit_share = profit * (license_info.profit_share_percentage / 100.0)
+            
+            # Save revenue share record
+            if profit_share > 0:
+                self.db_manager.save_revenue_share(
+                    license_id=license_id,
+                    amount=profit_share,
+                    currency="USD",
+                    status="pending",
+                    metadata={
+                        "revenue": revenue,
+                        "profit": profit,
+                        "transactions": transaction_count,
+                        "percentage": license_info.profit_share_percentage
+                    }
+                )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error reporting revenue: {str(e)}")
+            return False
+    
+    def get_revenue_summary(self, license_id: str) -> Dict[str, Any]:
+        """
+        Get revenue summary for a license
+        
+        Args:
+            license_id: License ID
+            
+        Returns:
+            Revenue summary
+        """
+        try:
+            # Get license info
+            license_result = self.db_manager.get_license(license_id)
+            if not license_result:
+                logger.error(f"License {license_id} not found")
+                return {"error": "License not found"}
+            
+            license_info, _ = license_result
+            
+            # Get usage metrics
+            metrics_list = self.db_manager.get_usage_metrics(license_id, days=30)
+            
+            # Calculate totals
+            total_revenue = sum(m.revenue for m in metrics_list)
+            total_profit = sum(m.profit for m in metrics_list)
+            total_transactions = sum(m.transaction_volume for m in metrics_list)
+            
+            # Get revenue shares
+            shares = self.db_manager.get_revenue_shares(license_id)
+            total_shares = sum(s["amount"] for s in shares)
+            pending_shares = sum(s["amount"] for s in shares if s["status"] == "pending")
+            processed_shares = sum(s["amount"] for s in shares if s["status"] == "processed")
+            
+            # Build summary
+            return {
+                "license_id": license_id,
+                "app_name": license_info.app_name,
+                "period_days": 30,
+                "total_revenue": total_revenue,
+                "total_profit": total_profit,
+                "total_transactions": total_transactions,
+                "profit_share_percentage": license_info.profit_share_percentage,
+                "total_shares": total_shares,
+                "pending_shares": pending_shares,
+                "processed_shares": processed_shares,
+                "last_update": max([m.last_update for m in metrics_list]) if metrics_list else None
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting revenue summary: {str(e)}")
+            return {"error": str(e)}
+
+class ExportManager:
+    """Manages exporting applications out of the sandbox"""
+    
+    def __init__(self):
+        """Initialize the export manager"""
+        self.license_manager = LicenseManager()
+    
+    def prepare_export(
+        self, 
+        app_dir: str, 
+        license_info: LicenseInfo, 
+        target_dir: str
+    ) -> str:
+        """
+        Prepare an app for export
+        
+        Args:
+            app_dir: Source app directory
+            license_info: License information
+            target_dir: Target directory for export
+            
+        Returns:
+            Path to exported app
+        """
+        # Create target directory
+        export_dir = os.path.join(target_dir, license_info.app_name.replace(" ", "_"))
+        os.makedirs(export_dir, exist_ok=True)
+        
+        # Copy app files
+        for item in os.listdir(app_dir):
+            s = os.path.join(app_dir, item)
+            d = os.path.join(export_dir, item)
+            if os.path.isdir(s):
+                shutil.copytree(s, d, dirs_exist_ok=True)
+            else:
+                shutil.copy2(s, d)
+        
+        # Apply license to code
+        self.license_manager.apply_license_embedded(license_info, export_dir)
+        
+        # Create license file
+        license_key = self.license_manager.get_license_key(license_info.license_id)
+        license_file = os.path.join(export_dir, "KALEIDOSCOPE_LICENSE.json")
+        
+        with open(license_file, 'w') as f:
+            json.dump({
+                "license_id": license_info.license_id,
+                "license_key": license_key,
+                "app_id": license_info.app_id,
+                "app_name": license_info.app_name,
+                "user_id": license_info.user_id,
+                "license_type": license_info.license_type.name,
+                "subscription_tier": license_info.subscription_tier.name,
+                "creation_date": license_info.creation_date,
+                "expiration_date": license_info.expiration_date,
+                "profit_share_percentage": license_info.profit_share_percentage,
+                "terms_url": "https://kaleidoscopeai.com/license/terms",
+                "reporting_url": "https://kaleidoscopeai.com/license/report"
+            }, f, indent=2)
+        
+        # Create tracking script
+        self._create_tracking_script(export_dir, license_info)
+        
+        # Create README with instructions
+        readme_file = os.path.join(export_dir, "README.md")
+        with open(readme_file, 'w') as f:
+            f.write(f"""# {license_info.app_name}
+
+## Kaleidoscope AI License
+
+This application was generated by Kaleidoscope AI and is subject to the terms of the Kaleidoscope AI License.
+
+License ID: {license_info.license_id}
+License Type: {license_info.license_type.name}
+Profit Share Percentage: {license_info.profit_share_percentage}%
+
+### Revenue Reporting
+
+As part of the license agreement, you are required to report revenue generated by this application.
+You can do this using the built-in reporting script:
+
+```
+python kaleidoscope_report.py --revenue 1000 --profit 200
+```
+
+You can also use the Kaleidoscope AI dashboard at https://kaleidoscopeai.com/dashboard to report revenue.
+
+### License Terms
+
+The full license terms are available at https://kaleidoscopeai.com/license/terms
+
+For questions about your license, please contact support@kaleidoscopeai.com
+""")
+        
+        return export_dir
+    
+    def _create_tracking_script(self, export_dir: str, license_info: LicenseInfo) -> None:
+        """
+        Create a tracking script for revenue reporting
+        
+        Args:
+            export_dir: Export directory
+            license_info: License information
+        """
+        script_file = os.path.join(export_dir, "kaleidoscope_report.py")
+        
+        with open(script_file, 'w') as f:
+            f.write(f"""#!/usr/bin/env python3
+# Kaleidoscope AI Revenue Reporting Tool
+# DO NOT MODIFY THIS FILE
+
+import os
+import sys
+import time
+import json
+import uuid
+import argparse
+import logging
+import requests
+from typing import Dict, Any, Optional
+
+API_BASE_URL = "https://api.kaleidoscopeai.com/v1"
+LICENSE_ID = "{license_info.license_id}"
+APP_ID = "{license_info.app_id}"
+APP_NAME = "{license_info.app_name}"
+
+def report_revenue(
+    revenue: float, 
+    profit: Optional[float] = None, 
+    transactions: int = 1, 
+    api_key: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    \"\"\"
+    Report revenue to Kaleidoscope AI
+    
+    Args:
+        revenue: Revenue amount
+        profit: Optional profit amount (estimated if not provided)
+        transactions: Number of transactions
+        api_key: Optional API key (will use environment variable if not provided)
+        metadata: Optional metadata
+        
+    Returns:
+        Response from server
+    \"\"\"
+    # Use API key from environment if not provided
+    api_key = api_key or os.environ.get('KALEIDOSCOPE_API_KEY')
+    
+    # Get license info from file
+    license_file = os.path.join(os.path.dirname(__file__), "KALEIDOSCOPE_LICENSE.json")
+    
+    try:
+        with open(license_file, 'r') as f:
+            license_data = json.load(f)
+    except Exception as e:
+        print(f"Error reading license file: {str(e)}")
+        return {{"error": "License file not found or invalid"}}
+    
+    # Prepare report data
+    report_data = {{
+        "license_id": LICENSE_ID,
+        "app_id": APP_ID,
+        "revenue": revenue,
+        "profit": profit if profit is not None else (revenue * 0.2),
+        "transactions": transactions,
+        "timestamp": time.time(),
+        "metadata": metadata or {{}},
+        "license_key": license_data.get("license_key", "")
+    }}
+    
+    # If no API key, save to local file instead
+    if not api_key:
+        report_file = os.path.join(os.path.dirname(__file__), "kaleidoscope_reports.json")
+        
+        # Load existing reports
+        try:
+            with open(report_file, 'r') as f:
+                reports = json.load(f)
+        except:
+            reports = []
+        
+        # Add new report
+        reports.append(report_data)
+        
+        # Save reports
+        with open(report_file, 'w') as f:
+            json.dump(reports, f, indent=2)
+        
+        print(f"Revenue report saved to {report_file}")
+        return {{"status": "saved_locally", "file": report_file}}
+    
+    # Send report to API
+    try:
+        response = requests.post(
+            f"{{API_BASE_URL}}/reports/revenue",
+            json=report_data,
+            headers={{"Authorization": f"Bearer {{api_key}}"}}
+        )
+        
+        if response.status_code == 200:
+            print("Revenue reported successfully")
+            return response.json()
+        else:
+            print(f"Error reporting revenue: {{response.status_code}}")
+            print(response.text)
+            return {{"error": response.text}}
+    except Exception as e:
+        print(f"Error reporting revenue: {{str(e)}}")
+        return {{"error": str(e)}}
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Kaleidoscope AI Revenue Reporting Tool")
+    parser.add_argument("--revenue", type=float, required=True, help="Revenue amount")
+    parser.add_argument("--profit", type=float, help="Profit amount (estimated if not provided)")
+    parser.add_argument("--transactions", type=int, default=1, help="Number of transactions")
+    parser.add_argument("--api-key", help="API key (uses environment variable if not provided)")
+    
+    args = parser.parse_args()
+    
+    report_revenue(
+        revenue=args.revenue,
+        profit=args.profit,
+        transactions=args.transactions,
+        api_key=args.api_key
+    )
+""")
+        
+        # Make executable
+        os.chmod(script_file, 0o755)
+
+class SubscriptionManager:
+    """Manages user subscriptions"""
+    
+    def __init__(self, stripe_key: Optional[str] = None):
+        """
+        Initialize the subscription manager
+        
+        Args:
+            stripe_key: Optional Stripe API key
+        """
+        self.stripe_key = stripe_key or os.environ.get('STRIPE_API_KEY')
+        
+        if self.stripe_key:
+            stripe.api_key = self.stripe_key
+            self.stripe_enabled = True
+        else:
+            self.stripe_enabled = False
+            logger.warning("Stripe API key not found, payment features disabled")
+    
+    def get_subscription_details(self, tier: SubscriptionTier) -> Dict[str, Any]:
+        """
+        Get subscription details for a tier
+        
+        Args:
+            tier: Subscription tier
+            
+        Returns:
+            Subscription details
+        """
+        # Define subscription tiers
+        tiers = {
+            SubscriptionTier.FREE: {
+                "name": "Free",
+                "price_monthly": 0,
+                "price_yearly": 0,
+                "features": [
+                    "Generate up to 3 applications per month",
+                    "Sandbox testing limited to 1 hour",
+                    "Standard application templates",
+                    "Community support"
+                ],
+                "limits": {
+                    "apps_per_month": 3,
+                    "sandbox_hours": 1,
+                    "export_enabled": False,
+                    "profit_share": 15.0  # 15% profit share
+                }
+            },
+            SubscriptionTier.BASIC: {
+                "name": "Basic",
+                "price_monthly": 9.99,
+                "price_yearly": 99.99,
+                "features": [
+                    "Generate up to 10 applications per month",
+                    "Sandbox testing up to 4 hours",
+                    "Standard and premium templates",
+                    "Export applications with license",
+                    "Email support"
+                ],
+                "limits": {
+                    "apps_per_month": 10,
+                    "sandbox_hours": 4,
+                    "export_enabled": True,
+                    "profit_share": 10.0  # 10% profit share
+                }
+            },
+            SubscriptionTier.PROFESSIONAL: {
+                "name": "Professional",
+                "price_monthly": 29.99,
+                "price_yearly": 299.99,
+                "features": [
+                    "Generate up to 30 applications per month",
+                    "Sandbox testing up to 12 hours",
+                    "All application templates",
+                    "Export applications with license",
+                    "Priority email support",
+                    "Revenue reporting API access"
+                ],
+                "limits": {
+                    "apps_per_month": 30,
+                    "sandbox_hours": 12,
+                    "export_enabled": True,
+                    "profit_share": 7.5  # 7.5% profit share
+                }
+            },
+            SubscriptionTier.PREMIUM: {
+                "name": "Premium",
+                "price_monthly": 99.99,
+                "price_yearly": 999.99,
+                "features": [
+                    "Generate up to 100 applications per month",
+                    "Sandbox testing up to 48 hours",
+                    "All application templates",
+                    "Custom templates",
+                    "Export applications with license",
+                    "Priority phone support",
+                    "Revenue reporting API access",
+                    "Custom branding"
+                ],
+                "limits": {
+                    "apps_per_month": 100,
+                    "sandbox_hours": 48,
+                    "export_enabled": True,
+                    "profit_share": 5.0  # 5% profit share
+                }
+            },
+            SubscriptionTier.ULTIMATE: {
+                "name": "Ultimate",
+                "price_monthly": 299.99,
+                "price_yearly": 2999.99,
+                "features": [
+                    "Unlimited application generation",
+                    "Unlimited sandbox testing",
+                    "All application templates",
+                    "Custom templates",
+                    "Export applications with license",
+                    "Dedicated support",
+                    "Revenue reporting API access",
+                    "Custom branding",
+                    "White-label option",
+                    "API access"
+                ],
+                "limits": {
+                    "apps_per_month": float('inf'),
+                    "sandbox_hours": float('inf'),
+                    "export_enabled": True,
+                    "profit_share": 2.5  # 2.5% profit share
+                }
+            }
+        }
+        
+        # Return tier details or FREE if not found
+        return tiers.get(tier, tiers[SubscriptionTier.FREE])
+    
+    def create_checkout_session(
+        self, 
+        user_id: str, 
+        tier: SubscriptionTier, 
+        period: str = "monthly"
+    ) -> Dict[str, Any]:
+        """
+        Create a checkout session for a subscription
+        
+        Args:
+            user_id: User ID
+            tier: Subscription tier
+            period: Billing period (monthly or yearly)
+            
+        Returns:
+            Checkout session information
+        """
+        if not self.stripe_enabled:
+            return {"error": "Payment processing not available"}
+        
+        # Get subscription details
+        details = self.get_subscription_details(tier)
+        price = details["price_yearly"] if period == "yearly" else details["price_monthly"]
+        
+        # Skip checkout for free tier
+        if price == 0:
+            return {
+                "status": "free_tier",
+                "tier": tier.name,
+                "message": "Free tier selected, no payment required"
+            }
+        
+        try:
+            # Create Stripe checkout session
+            session = stripe.checkout.Session.create(
+                customer_email=user_id,  # Assuming user_id is an email
+                payment_method_types=['card'],
+                line_items=[
+                    {
+                        'price_data': {
+                            'currency': 'usd',
+                            'product_data': {
+                                'name': f"Kaleidoscope AI {details['name']} ({period})",
+                                'description': "AI-powered application generation and licensing",
+                            },
+                            'unit_amount': int(price * 100),  # Convert to cents
+                            'recurring': {
+                                'interval': 'year' if period == "yearly" else 'month',
+                            },
+                        },
+                        'quantity': 1,
+                    },
+                ],
+                mode='subscription',
+                success_url='https://kaleidoscopeai.com/subscription/success?session_id={CHECKOUT_SESSION_ID}',
+                cancel_url='https://kaleidoscopeai.com/subscription/cancel',
+                metadata={
+                    'user_id': user_id,
+                    'tier': tier.name,
+                    'period': period
+                }
+            )
+            
+            return {
+                "status": "checkout_created",
+                "session_id": session.id,
+                "checkout_url": session.url
+            }
+            
+        except Exception as e:
+            logger.error(f"Error creating checkout session: {str(e)}")
+            return {"error": str(e)}
+    
+    def process_webhook(self, payload: Dict[str, Any], signature: str) -> Dict[str, Any]:
+        """
+        Process a Stripe webhook
+        
+        Args:
+            payload: Webhook payload
+            signature: Webhook signature
+            
+        Returns:
+            Processing result
+        """
+        if not self.stripe_enabled:
+            return {"error": "Payment processing not available"}
+        
+        try:
+            # Verify webhook signature
+            endpoint_secret = os.environ.get('STRIPE_WEBHOOK_SECRET')
+            if not endpoint_secret:
+                return {"error": "Webhook secret not configured"}
+            
+            event = stripe.Webhook.construct_event(
+                payload, signature, endpoint_secret
+            )
+            
+            # Handle event types
+            event_type = event['type']
+            
+            if event_type == 'checkout.session.completed':
+                # Handle successful checkout
+                session = event['data']['object']
+                user_id = session['metadata']['user_id']
+                tier = session['metadata']['tier']
+                period = session['metadata']['period']
+                
+                # Create or update subscription in your system
+                # This would typically involve updating a user record in your database
+                
+                return {
+                    "status": "subscription_activated",
+                    "user_id": user_id,
+                    "tier": tier,
+                    "period": period
+                }
+                
+            elif event_type == 'customer.subscription.updated':
+                # Handle subscription update
+                subscription = event['data']['object']
+                customer_id = subscription['customer']
+                
+                # Update subscription in your system
+                
+                return {
+                    "status": "subscription_updated",
+                    "customer_id": customer_id
+                }
+                
+            elif event_type == 'customer.subscription.deleted':
+                # Handle subscription cancellation
+                subscription = event['data']['object']
+                customer_id = subscription['customer']
+                
+                # Update subscription in your system
+                
+                return {
+                    "status": "subscription_cancelled",
+                    "customer_id": customer_id
+                }
+            
+            else:
+                # Unhandled event type
+                return {
+                    "status": "unhandled_event",
+                    "event_type": event_type
+                }
+                
+        except Exception as e:
+            logger.error(f"Error processing webhook: {str(e)}")
+            return {"error": str(e)}
+
+class KaleidoscopeLicensing:
+    """Main class for the Kaleidoscope AI licensing system"""
+    
+    def __init__(self):
+        """Initialize the licensing system"""
+        self.license_manager = LicenseManager()
+        self.usage_tracker = UsageTracker()
+        self.revenue_tracker = RevenueTracker()
+        self.export_manager = ExportManager()
+        self.subscription_manager = SubscriptionManager()
+    
+    def create_app_license(
+        self, 
+        user_id: str, 
+        app_id: str, 
+        app_name: str,
+        subscription_tier: SubscriptionTier,
+        license_type: LicenseType = LicenseType.PERSONAL,
+        expiration_days: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Create a license for an app
+        
+        Args:
+            user_id: User ID
+            app_id: App ID
+            app_name: App name
+            subscription_tier: Subscription tier
+            license_type: License type
+            expiration_days: Number of days until expiration (None for perpetual)
+            
+        Returns:
+            License information
+        """
+        try:
+            # Get subscription details
+            subscription = self.subscription_manager.get_subscription_details(subscription_tier)
+            
+            # Set profit share percentage from subscription tier
+            profit_share = subscription["limits"]["profit_share"]
+            
+            # Create license
+            license_info, license_key = self.license_manager.create_license(
+                user_id=user_id,
+                app_id=app_id,
+                app_name=app_name,
+                license_type=license_type,
+                subscription_tier=subscription_tier,
+                expiration_days=expiration_days,
+                profit_share_percentage=profit_share,
+                usage_limits=subscription["limits"],
+                features=set(subscription["features"]),
+                metadata={
+                    "subscription_tier": subscription_tier.name,
+                    "license_type": license_type.name
+                }
+            )
+            
+            return {
+                "license_id": license_info.license_id,
+                "license_key": license_key,
+                "app_id": app_id,
+                "app_name": app_name,
+                "license_type": license_type.name,
+                "subscription_tier": subscription_tier.name,
+                "profit_share_percentage": profit_share,
+                "creation_date": license_info.creation_date,
+                "expiration_date": license_info.expiration_date
+            }
+            
+        except Exception as e:
+            logger.error(f"Error creating app license: {str(e)}")
+            return {"error": str(e)}
+    
+    def validate_app_license(self, app_id: str) -> Dict[str, Any]:
+        """
+        Validate a license for an app
+        
+        Args:
+            app_id: App ID
+            
+        Returns:
+            Validation result
+        """
+        try:
+            valid, license_info = self.license_manager.validate_app_license(app_id)
+            
+            if not valid or not license_info:
+                return {
+                    "valid": False,
+                    "message": "Invalid or expired license"
+                }
+            
+            return {
+                "valid":#!/usr/bin/env python3
+"""
+Kaleidoscope AI - Licensing and Monetization System
+==================================================
+Comprehensive licensing system for managing application ownership,
+usage tracking, profit sharing, and subscription management.
+"""
+
+import os
+import sys
+import time
+import json
+import uuid
+import hmac
+import hashlib
+import base64
+import logging
+import requests
+import sqlite3
+import datetime
+import threading
+import asyncio
+import jwt
+import stripe
+import docker
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Any, Optional, Union, Set, Tuple
+from enum import Enum, auto
+from pathlib import Path
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from contextlib import contextmanager
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("licensing.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Constants
+LICENSE_DB_PATH = "kaleidoscope_licenses.db"
+ENCRYPTION_KEY_ENV = "KALEIDOSCOPE_ENCRYPTION_KEY"
+JWT_SECRET_ENV = "KALEIDOSCOPE_JWT_SECRET"
+API_BASE_URL = "https://api.kaleidoscopeai.com/v1"
+DEFAULT_PROFIT_SHARE_PERCENTAGE = 5.0  # 5% profit share
+USAGE_TRACKING_INTERVAL = 3600  # 1 hour
+
+class LicenseType(Enum):
+    """Types of licenses"""
+    PERSONAL = auto()
+    STARTUP = auto()
+    BUSINESS = auto()
+    ENTERPRISE = auto()
+    EDUCATIONAL = auto()
+    NONPROFIT = auto()
+    TRIAL = auto()
+
+class SubscriptionTier(Enum):
+    """Subscription tiers"""
+    FREE = auto()
+    BASIC = auto()
+    PROFESSIONAL = auto()
+    PREMIUM = auto()
+    ULTIMATE = auto()
+
+@dataclass
+class LicenseInfo:
+    """License information"""
+    license_id: str
+    user_id: str
+    app_id: str
+    app_name: str
+    license_type: LicenseType
+    subscription_tier: SubscriptionTier
+    creation_date: float
+    expiration_date: Optional[float] = None
+    profit_share_percentage: float = DEFAULT_PROFIT_SHARE_PERCENTAGE
+    usage_limits: Dict[str, Any] = field(default_factory=dict)
+    features: Set[str] = field(default_factory=set)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        result = asdict(self)
+        # Convert enum values to strings
+        result['license_type'] = self.license_type.name
+        result['subscription_tier'] = self.subscription_tier.name
+        # Convert set to list
+        result['features'] = list(self.features)
+        return result
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'LicenseInfo':
+        """Create from dictionary"""
+        # Convert string values to enums
+        if 'license_type' in data:
+            data['license_type'] = LicenseType[data['license_type']]
+        if 'subscription_tier' in data:
+            data['subscription_tier'] = SubscriptionTier[data['subscription_tier']]
+        # Convert list to set
+        if 'features' in data:
+            data['features'] = set(data['features'])
+        return cls(**data)
+    
+    def is_valid(self) -> bool:
+        """Check if license is valid"""
+        if self.expiration_date is None:
+            return True
+        return time.time() < self.expiration_date
+
+@dataclass
+class UsageMetrics:
+    """Usage metrics for billing and monitoring"""
+    app_id: str
+    license_id: str
+    start_time: float
+    cpu_time: float = 0.0
+    memory_usage: float = 0.0
+    storage_usage: float = 0.0
+    api_calls: int = 0
+    user_count: int = 0
+    transaction_volume: float = 0.0
+    revenue: float = 0.0
+    profit: float = 0.0
+    last_update: float = field(default_factory=time.time)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+class EncryptionManager:
+    """Manages encryption for sensitive data"""
+    
+    def __init__(self, key_env_var: str = ENCRYPTION_KEY_ENV):
+        """
+        Initialize the encryption manager
+        
+        Args:
+            key_env_var: Environment variable containing the encryption key
+        """
+        # Get encryption key from environment or generate one
+        key_base64 = os.environ.get(key_env_var)
+        if key_base64:
+            self.key = base64.urlsafe_b64decode(key_base64)
+        else:
+            # Generate a new key
+            self.key = Fernet.generate_key()
+            # Log the key for setup purposes (would be removed in production)
+            key_base64 = base64.urlsafe_b64encode(self.key).decode()
+            logger.warning(f"Generated new encryption key. Set {key_env_var}={key_base64}")
+        
+        self.cipher = Fernet(self.key)
+    
+    def encrypt(self, data: str) -> str:
+        """
+        Encrypt data
+        
+        Args:
+            data: Data to encrypt
+            
+        Returns:
+            Encrypted data (base64 encoded)
+        """
+        return self.cipher.encrypt(data.encode()).decode()
+    
+    def decrypt(self, encrypted_data: str) -> str:
+        """
+        Decrypt data
+        
+        Args:
+            encrypted_data: Encrypted data (base64 encoded)
+            
+        Returns:
+            Decrypted data
+        """
+        return self.cipher.decrypt(encrypted_data.encode()).decode()
+    
+    def generate_license_key(self, license_info: LicenseInfo) -> str:
+        """
+        Generate a license key
+        
+        Args:
+            license_info: License information
+            
+        Returns:
+            License key
+        """
+        # Create license data
+        license_data = {
+            "license_id": license_info.license_id,
+            "user_id": license_info.user_id,
+            "app_id": license_info.app_id,
+            "type": license_info.license_type.name,
+            "tier": license_info.subscription_tier.name,
+            "created": license_info.creation_date,
+            "expires": license_info.expiration_date
+        }
+        
+        # Convert to JSON and encrypt
+        license_json = json.dumps(license_data)
+        encrypted = self.encrypt(license_json)
+        
+        # Format as a license key
+        prefix = "KAI"
+        checksum = self._calculate_checksum(encrypted)
+        license_key = f"{prefix}-{encrypted[:8]}-{encrypted[8:16]}-{encrypted[16:24]}-{checksum[:6]}"
+        
+        return license_key
+    
+    def _calculate_checksum(self, data: str) -> str:
+        """
+        Calculate checksum for data
+        
+        Args:
+            data: Data to calculate checksum for
+            
+        Returns:
+            Checksum (hex encoded)
+        """
+        return hashlib.sha256(data.encode()).hexdigest()
+
+class DatabaseManager:
+    """Manages database operations for license storage"""
+    
+    def __init__(self, db_path: str = LICENSE_DB_PATH):
+        """
+        Initialize the database manager
+        
+        Args:
+            db_path: Path to the SQLite database
+        """
+        self.db_path = db_path
+        self._init_db()
+    
+    def _init_db(self) -> None:
+        """Initialize the database schema"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Create licenses table
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS licenses (
+                license_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                app_id TEXT NOT NULL,
+                app_name TEXT NOT NULL,
+                license_type TEXT NOT NULL,
+                subscription_tier TEXT NOT NULL,
+                creation_date REAL NOT NULL,
+                expiration_date REAL,
+                profit_share_percentage REAL NOT NULL,
+                usage_limits TEXT,
+                features TEXT,
+                metadata TEXT,
+                license_key TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            )
+            ''')
+            
+            # Create usage metrics table
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS usage_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id TEXT NOT NULL,
+                license_id TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                cpu_time REAL NOT NULL,
+                memory_usage REAL NOT NULL,
+                storage_usage REAL NOT NULL,
+                api_calls INTEGER NOT NULL,
+                user_count INTEGER NOT NULL,
+                transaction_volume REAL NOT NULL,
+                revenue REAL NOT NULL,
+                profit REAL NOT NULL,
+                metadata TEXT,
+                FOREIGN KEY (license_id) REFERENCES licenses (license_id)
+            )
+            ''')
+            
+            # Create revenue share table
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS revenue_shares (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                license_id TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL,
+                payment_id TEXT,
+                status TEXT NOT NULL,
+                metadata TEXT,
+                FOREIGN KEY (license_id) REFERENCES licenses (license_id)
+            )
+            ''')
+            
+            # Create index on app_id for licenses
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_licenses_app_id ON licenses (app_id)
+            ''')
+            
+            # Create index on license_id for usage metrics
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_usage_metrics_license_id ON usage_metrics (license_id)
+            ''')
+            
+            conn.commit()
+    
+    @contextmanager
+    def _get_connection(self):
+        """Get a database connection"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+    
+    def save_license(self, license_info: LicenseInfo, license_key: str) -> bool:
+        """
+        Save a license to the database
+        
+        Args:
+            license_info: License information
+            license_key: Generated license key
+            
+        Returns:
+            Success status
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute('''
+                INSERT OR REPLACE INTO licenses (
+                    license_id, user_id, app_id, app_name, license_type, 
+                    subscription_tier, creation_date, expiration_date, 
+                    profit_share_percentage, usage_limits, features, 
+                    metadata, license_key, active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    license_info.license_id,
+                    license_info.user_id,
+                    license_info.app_id,
+                    license_info.app_name,
+                    license_info.license_type.name,
+                    license_info.subscription_tier.name,
+                    license_info.creation_date,
+                    license_info.expiration_date,
+                    license_info.profit_share_percentage,
+                    json.dumps(license_info.usage_limits),
+                    json.dumps(list(license_info.features)),
+                    json.dumps(license_info.metadata),
+                    license_key,
+                    1  # active
+                ))
+                
+                conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"Error saving license: {str(e)}")
+                return False
+    
+    def get_license(self, license_id: str) -> Optional[Tuple[LicenseInfo, str]]:
+        """
+        Get a license from the database
+        
+        Args:
+            license_id: License ID
+            
+        Returns:
+            Tuple of (license_info, license_key) or None
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+            SELECT * FROM licenses WHERE license_id = ? AND active = 1
+            ''', (license_id,))
+            
+            row = cursor.fetchone()
+            if not row:
+                return None
+            
+            # Convert row to dictionary
+            license_data = dict(row)
+            
+            # Parse JSON fields
+            license_data['usage_limits'] = json.loads(license_data['usage_limits'])
+            license_data['features'] = json.loads(license_data['features'])
+            license_data['metadata'] = json.loads(license_data['metadata'])
+            
+            # Extract license key
+            license_key = license_data.pop('license_key')
+            
+            # Remove active field
+            license_data.pop('active')
+            
+            # Create license info
+            license_info = LicenseInfo.from_dict(license_data)
+            
+            return license_info, license_key
+    
+    def get_license_by_app(self, app_id: str) -> Optional[Tuple[LicenseInfo, str]]:
+        """
+        Get a license for an app
+        
+        Args:
+            app_id: App ID
+            
+        Returns:
+            Tuple of (license_info, license_key) or None
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+            SELECT * FROM licenses WHERE app_id = ? AND active = 1
+            ''', (app_id,))
+            
+            row = cursor.fetchone()
+            if not row:
+                return None
+            
+            # Convert row to dictionary
+            license_data = dict(row)
+            
+            # Parse JSON fields
+            license_data['usage_limits'] = json.loads(license_data['usage_limits'])
+            license_data['features'] = json.loads(license_data['features'])
+            license_data['metadata'] = json.loads(license_data['metadata'])
+            
+            # Extract license key
+            license_key = license_data.pop('license_key')
+            
+            # Remove active field
+            license_data.pop('active')
+            
+            # Create license info
+            license_info = LicenseInfo.from_dict(license_data)
+            
+            return license_info, license_key
+    
+    def list_licenses(self, user_id: Optional[str] = None) -> List[Tuple[LicenseInfo, str]]:
+        """
+        List licenses
+        
+        Args:
+            user_id: Optional user ID to filter by
+            
+        Returns:
+            List of (license_info, license_key) tuples
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            if user_id:
+                cursor.execute('''
+                SELECT * FROM licenses WHERE user_id = ? AND active = 1
+                ''', (user_id,))
+            else:
+                cursor.execute('''
+                SELECT * FROM licenses WHERE active = 1
+                ''')
+            
+            rows = cursor.fetchall()
+            
+            licenses = []
+            for row in rows:
+                # Convert row to dictionary
+                license_data = dict(row)
+                
+                # Parse JSON fields
+                license_data['usage_limits'] = json.loads(license_data['usage_limits'])
+                license_data['features'] = json.loads(license_data['features'])
+                license_data['metadata'] = json.loads(license_data['metadata'])
+                
+                # Extract license key
+                license_key = license_data.pop('license_key')
+                
+                # Remove active field
+                license_data.pop('active')
+                
+                # Create license info
+                license_info = LicenseInfo.from_dict(license_data)
+                
+                licenses.append((license_info, license_key))
+            
+            return licenses
+    
+    def deactivate_license(self, license_id: str) -> bool:
+        """
+        Deactivate a license
+        
+        Args:
+            license_id: License ID
+            
+        Returns:
+            Success status
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+            UPDATE licenses SET active = 0 WHERE license_id = ?
+            ''', (license_id,))
+            
+            conn.commit()
+            return cursor.rowcount > 0
+    
+    def save_usage_metrics(self, metrics: UsageMetrics) -> bool:
+        """
+        Save usage metrics
+        
+        Args:
+            metrics: Usage metrics
+            
+        Returns:
+            Success status
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute('''
+                INSERT INTO usage_metrics (
+                    app_id, license_id, timestamp, cpu_time, memory_usage,
+                    storage_usage, api_calls, user_count, transaction_volume,
+                    revenue, profit, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    metrics.app_id,
+                    metrics.license_id,
+                    metrics.last_update,
+                    metrics.cpu_time,
+                    metrics.memory_usage,
+                    metrics.storage_usage,
+                    metrics.api_calls,
+                    metrics.user_count,
+                    metrics.transaction_volume,
+                    metrics.revenue,
+                    metrics.profit,
+                    json.dumps(metrics.metadata)
+                ))
+                
+                conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"Error saving usage metrics: {str(e)}")
+                return False
+    
+    def get_usage_metrics(self, license_id: str, days: int = 30) -> List[UsageMetrics]:
+        """
+        Get usage metrics for a license
+        
+        Args:
+            license_id: License ID
+            days: Number of days to retrieve metrics for
+            
+        Returns:
+            List of usage metrics
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            start_time = time.time() - (days * 86400)
+            
+            cursor.execute('''
+            SELECT * FROM usage_metrics
+            WHERE license_id = ? AND timestamp >= ?
+            ORDER BY timestamp ASC
+            ''', (license_id, start_time))
+            
+            rows = cursor.fetchall()
+            
+            metrics = []
+            for row in rows:
+                # Convert row to dictionary
+                data = dict(row)
+                
+                # Parse metadata
+                data['metadata'] = json.loads(data['metadata'])
+                
+                # Create metrics object
+                metrics_obj = UsageMetrics(
+                    app_id=data['app_id'],
+                    license_id=data['license_id'],
+                    start_time=data['timestamp'],
+                    cpu_time=data['cpu_time'],
+                    memory_usage=data['memory_usage'],
+                    storage_usage=data['storage_usage'],
+                    api_calls=data['api_calls'],
+                    user_count=data['user_count'],
+                    transaction_volume=data['transaction_volume'],
+                    revenue=data['revenue'],
+                    profit=data['profit'],
+                    last_update=data['timestamp'],
+                    metadata=data['metadata']
+                )
+                
+                metrics.append(metrics_obj)
+            
+            return metrics
+    
+    def save_revenue_share(
+        self, 
+        license_id: str, 
+        amount: float, 
+        currency: str = "USD",
+        payment_id: Optional[str] = None, 
+        status: str = "pending",
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Save a revenue share record
+        
+        Args:
+            license_id: License ID
+            amount: Amount to share
+            currency: Currency code
+            payment_id: Optional payment ID
+            status: Status of the share (pending, processed, failed)
+            metadata: Optional metadata
+            
+        Returns:
+            Success status
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute('''
+                INSERT INTO revenue_shares (
+                    license_id, timestamp, amount, currency,
+                    payment_id, status, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    license_id,
+                    time.time(),
+                    amount,
+                    currency,
+                    payment_id,
+                    status,
+                    json.dumps(metadata or {})
+                ))
+                
+                conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"Error saving revenue share: {str(e)}")
+                return False
+    
+    def get_revenue_shares(self, license_id: str) -> List[Dict[str, Any]]:
+        """
+        Get revenue shares for a license
+        
+        Args:
+            license_id: License ID
+            
+        Returns:
+            List of revenue share records
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+            SELECT * FROM revenue_shares WHERE license_id = ?
+            ORDER BY timestamp DESC
+            ''', (license_id,))
+            
+            rows = cursor.fetchall()
+            
+            shares = []
+            for row in rows:
+                data = dict(row)
+                data['metadata'] = json.loads(data['metadata'])
+                shares.append(data)
+            
+            return shares
+
+class LicenseManager:
+    """Manages license creation, validation, and enforcement"""
+    
+    def __init__(self):
+        """Initialize the license manager"""
+        self.encryption_manager = EncryptionManager()
+        self.db_manager = DatabaseManager()
+    
+    def create_license(
+        self, 
+        user_id: str, 
+        app_id: str, 
+        app_name: str,
+        license_type: LicenseType,
+        subscription_tier: SubscriptionTier,
+        expiration_days: Optional[int] = None,
+        profit_share_percentage: float = DEFAULT_PROFIT_SHARE_PERCENTAGE,
+        usage_limits: Optional[Dict[str, Any]] = None,
+        features: Optional[Set[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Tuple[LicenseInfo, str]:
+        """
+        Create a new license
+        
+        Args:
+            user_id: User ID
+            app_id: App ID
+            app_name: App name
+            license_type: License type
+            subscription_tier: Subscription tier
+            expiration_days: Number of days until expiration (None for perpetual)
+            profit_share_percentage: Profit share percentage
+            usage_limits: Optional usage limits
+            features: Optional set of features
+            metadata: Optional metadata
+            
+        Returns:
+            Tuple of (license_info, license_key)
+        """
+        license_id = str(uuid.uuid4())
+        creation_date = time.time()
+        
+        # Calculate expiration date if provided
+        expiration_date = None
+        if expiration_days is not None and expiration_days > 0:
+            expiration_date = creation_date + (expiration_days * 86400)
+        
+        # Create license info
+        license_info = LicenseInfo(
+            license_id=license_id,
+            user_id=user_id,
+            app_id=app_id,
+            app_name=app_name,
+            license_type=license_type,
+            subscription_tier=subscription_tier,
+            creation_date=creation_date,
+            expiration_date=expiration_date,
+            profit_share_percentage=profit_share_percentage,
+            usage_limits=usage_limits or {},
+            features=features or set(),
+            metadata=metadata or {}
+        )
+        
+        # Generate license key
+        license_key = self.encryption_manager.generate_license_key(license_info)
+        
+        # Save to database
+        if not self.db_manager.save_license(license_info, license_key):
+            raise RuntimeError("Failed to save license to database")
+        
+        return license_info, license_key
+    
+    def validate_license(self, license_id: str) -> Tuple[bool, Optional[LicenseInfo]]:
+        """
+        Validate a license
+        
+        Args:
+            license_id: License ID
+            
+        Returns:
+            Tuple of (valid, license_info)
+        """
+        # Get license from database
+        result = self.db_manager.get_license(license_id)
+        if not result:
+            return False, None
+        
+        license_info, _ = result
+        
+        # Check if license is valid
+        if not license_info.is_valid():
+            return False, license_info
+        
+        return True, license_info
+    
+    def validate_app_license(self, app_id: str) -> Tuple[bool, Optional[LicenseInfo]]:
+        """
+        Validate a license for an app
+        
+        Args:
+            app_id: App ID
+            
+        Returns:
+            Tuple of (valid, license_info)
+        """
+        # Get license from database
+        result = self.db_manager.get_license_by_app(app_id)
+        if not result:
+            return False, None
+        
+        license_info, _ = result
+        
+        # Check if license is valid
+        if not license_info.is_valid():
+            return False, license_info
+        
+        return True, license_info
+    
+    def get_license_key(self, license_id: str) -> Optional[str]:
+        """
+        Get a license key
+        
+        Args:
+            license_id: License ID
+            
+        Returns:
+            License key or None
+        """
+        # Get license from database
+        result = self.db_manager.get_license(license_id)
+        if not result:
+            return None
+        
+        _, license_key = result
+        return license_key
+    
+    def list_user_licenses(self, user_id: str) -> List[Tuple[LicenseInfo, str]]:
+        """
+        List licenses for a user
+        
+        Args:
+            user_id: User ID
+            
+        Returns:
+            List of (license_info, license_key) tuples
+        """
+        return self.db_manager.list_licenses(user_id)
+    
+    def revoke_license(self, license_id: str) -> bool:
+        """
+        Revoke a license
+        
+        Args:
+            license_id: License ID
+            
+        Returns:
+            Success status
+        """
+        return self.db_manager.deactivate_license(license_id)
+    
+    def apply_license_embedded(
+        self, 
+        license_info: LicenseInfo, 
+        code_directory: str
+    ) -> bool:
+        """
+        Apply license information to code
+        
+        Args:
+            license_info: License information
+            code_directory: Directory containing code
+            
+        Returns:
+            Success status
+        """
+        try:
+            license_data = license_info.to_dict()
+            license_key = self.encryption_manager.generate_license_key(license_info)
+            
+            # Find main source files to embed license
+            embedded = False
+            
+            # Python
+            py_files = list(Path(code_directory).glob("**/*.py"))
+            for py_file in py_files:
+                # Look for main/app files
+                filename = py_file.name.lower()
+                if any(name in filename for name in ["main", "app", "init", "setup"]):
+                    # Embed license
+                    self._embed_license_in_file(py_file, license_key, license_data, "python")
+                    embedded = True
+                    break
+            
+            # JavaScript/TypeScript
+            js_files = list(Path(code_directory).glob("**/*.js")) + list(Path(code_directory).glob("**/*.ts"))
+            for js_file in js_files:
+                # Look for main/app files
+                filename = js_file.name.lower()
+                if any(name in filename for name in ["main", "app", "index", "server"]):
+                    # Embed license
+                    self._embed_license_in_file(js_file, license_key, license_data, "javascript")
+                    embedded = True
+                    break
+            
+            # If no suitable files found, create a license file
+            if not embedded:
+                license_file = os.path.join(code_directory, "LICENSE.json")
+                with open(license_file, 'w') as f:
+                    json.dump({
+                        "license_key": license_key,
+                        "info": license_data
+                    }, f, indent=2)
+                embedded = True
+            
+            return embedded
+            
+        except Exception as e:
+            logger.error(f"Error applying embedded license: {str(e)}")
+            return False
+    
+    def _embed_license_in_file(
+        self, 
+        file_path: str, 
+        license_key: str, 
+        license_data: Dict[str, Any],
+        language: str
+    ) -> None:
+        """
+        Embed license information in a file
+        
+        Args:
+            file_path: Path to the file
+            license_key: License key
+            license_data: License data
+            language: Programming language
+        """
+        # Read file content
+        with open(file_path, 'r') as f:
+            content = f.read()
+        
+        # Create license comment
+        if language == "python":
+            license_comment = f"""
+# KALEIDOSCOPE AI LICENSE
+# ------------------------
+# License Key: {license_key}
+# DO NOT REMOVE OR MODIFY THIS SECTION
+# Visit https://kaleidoscopeai.com/license for more information
+"""
+        elif language == "javascript":
+            license_comment = f"""
+// KALEIDOSCOPE AI LICENSE
+// ------------------------
+// License Key: {license_key}
+// DO NOT REMOVE OR MODIFY THIS SECTION
+// Visit https://kaleidoscopeai.com/license for more information
+"""
+        else:
+            license_comment = f"""
+/*
+ * KALEIDOSCOPE AI LICENSE
+ * ------------------------
+ * License Key: {license_key}
+ * DO NOT REMOVE OR MODIFY THIS SECTION
+ * Visit https://kaleidoscopeai.com/license for more information
+ */
+"""
+        
+        # Add license comment to the beginning of the file
+        new_content = license_comment + "\n" + content
+        
+        # Write updated content
+        with open(file_path, 'w') as f:
+            f.write(new_content)
+
+class UsageTracker:
+    """Tracks application usage for billing and revenue sharing"""
+    
+    def __init__(self, interval: int = USAGE_TRACKING_INTERVAL):
+        """
+        Initialize the usage tracker
+        
+        Args:
+            interval: Tracking interval in seconds
+        """
+        self.db_manager = DatabaseManager()
+        self.interval = interval
+        self.tracking_threads = {}
+        self.docker_client = None
+        try:
+            self.docker_client = docker.from_env()
+        except Exception as e:
+            logger.warning(f"Docker client initialization failed: {str(e)}")
+    
+    def start_tracking(self, license_info: LicenseInfo, container_id: Optional[str] = None) -> bool:
+        """
+        Start tracking usage for an app
+        
+        Args:
+            license_info

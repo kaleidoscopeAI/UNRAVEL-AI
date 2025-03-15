@@ -1,0 +1,587 @@
+#!/usr/bin/env python3
+"""
+Kaleidoscope AI System API
+Provides a FastAPI interface for interaction with the Kaleidoscope AI system.
+"""
+
+import os
+import sys
+import json
+import time
+import logging
+import tempfile
+import asyncio
+import uvicorn
+from typing import Dict, List, Any, Optional, Union
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException, Depends, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+import numpy as np
+import networkx as nx
+from concurrent.futures import ThreadPoolExecutor
+import traceback
+
+# Add parent directory to path for importing the Kaleidoscope modules
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import Kaleidoscope components
+from kaleidoscope_core import KaleidoscopeSystem
+from kaleidoscope_extensions import KaleidoscopeExtensions
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler("kaleidoscope_api.log"), logging.StreamHandler()]
+)
+logger = logging.getLogger("KaleidoscopeAPI")
+
+# Initialize Kaleidoscope system
+kaleidoscope_data_dir = os.environ.get('KALEIDOSCOPE_DATA', './kaleidoscope_data')
+os.makedirs(kaleidoscope_data_dir, exist_ok=True)
+
+system_config = {
+    'db_path': os.path.join(kaleidoscope_data_dir, 'kaleidoscope.db'),
+    'initial_nodes': 10,
+    'initial_supernodes': 3,
+    'cube_dimensions': (10, 10, 10)
+}
+
+extensions_config = {
+    'use_ghidra': False,
+    'use_retdec': True,
+    'use_radare2': True,
+    'use_remote_databases': True
+}
+
+# Initialize components
+try:
+    k_system = KaleidoscopeSystem(config_path=None)
+    k_extensions = KaleidoscopeExtensions(
+        working_dir=kaleidoscope_data_dir,
+        config=extensions_config
+    )
+    logger.info("Kaleidoscope components initialized successfully")
+except Exception as e:
+    logger.error(f"Error initializing Kaleidoscope components: {str(e)}")
+    logger.error(traceback.format_exc())
+    sys.exit(1)
+
+# Create FastAPI app
+app = FastAPI(
+    title="Kaleidoscope AI API",
+    description="API for interacting with the Kaleidoscope AI system.",
+    version="1.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Thread pool for background tasks
+executor = ThreadPoolExecutor(max_workers=4)
+
+# Define API models
+class DataInput(BaseModel):
+    data: Any
+    data_type: Optional[str] = None
+    domain: Optional[str] = None
+    
+class BinaryInput(BaseModel):
+    binary_path: str
+    output_language: Optional[str] = "c"
+    analyze: Optional[bool] = True
+    
+class MoleculeInput(BaseModel):
+    molecule: str
+    input_format: Optional[str] = "smiles"
+    
+class DockingInput(BaseModel):
+    molecule_id: str
+    target: str
+    exhaustiveness: Optional[int] = 8
+    
+class CrossDomainInput(BaseModel):
+    domains: List[str]
+    
+class SystemStatusResponse(BaseModel):
+    system_active: bool
+    uptime: float
+    processed_inputs: int
+    insights_generated: int
+    nodes: Dict
+    supernodes: Dict
+    engine: Dict
+    cube: Dict
+    extensions: Dict
+    
+class ApiResponse(BaseModel):
+    success: bool
+    message: Optional[str] = None
+    result: Optional[Any] = None
+    error: Optional[str] = None
+    timestamp: float = Field(default_factory=time.time)
+
+# Background task functions
+def process_data_background(data: Any, data_type: str = None):
+    try:
+        return k_system.process_input(data, data_type)
+    except Exception as e:
+        logger.error(f"Error in background processing: {str(e)}")
+        return {"success": False, "error": str(e)}
+
+def regenerate_system_background():
+    try:
+        k_system.regenerate_nodes()
+        result = k_system.evolve_system()
+        return result
+    except Exception as e:
+        logger.error(f"Error in system evolution: {str(e)}")
+        return {"success": False, "error": str(e)}
+
+# API routes
+@app.get("/", response_model=ApiResponse)
+async def root():
+    """Root endpoint providing basic API information."""
+    return {
+        "success": True,
+        "message": "Kaleidoscope AI System API is running",
+        "result": {
+            "name": "Kaleidoscope AI",
+            "version": "1.0.0"
+        }
+    }
+
+@app.get("/status", response_model=ApiResponse)
+async def get_system_status():
+    """Get current system status."""
+    try:
+        status = k_system.get_system_status()
+        
+        # Add extensions status
+        extensions_status = {
+            "software_ingestion": {
+                "tools_available": k_extensions.software_ingestion.available_tools
+            },
+            "drug_discovery": {
+                "initialized": k_extensions.drug_discovery is not None
+            },
+            "pattern_recognition": {
+                "initialized": k_extensions.pattern_recognition is not None,
+                "pattern_types": len(k_extensions.pattern_recognition.pattern_signatures)
+            }
+        }
+        
+        status["extensions"] = extensions_status
+        
+        return {
+            "success": True,
+            "result": status
+        }
+    except Exception as e:
+        logger.error(f"Error getting system status: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to get system status: {str(e)}"
+        }
+
+@app.post("/process", response_model=ApiResponse)
+async def process_data(background_tasks: BackgroundTasks, input_data: DataInput):
+    """Process data through the Kaleidoscope AI system."""
+    try:
+        # Start processing in background
+        background_tasks.add_task(process_data_background, input_data.data, input_data.data_type)
+        
+        return {
+            "success": True,
+            "message": "Data processing started in background",
+            "result": {
+                "data_type": input_data.data_type or "auto-detected",
+                "task_id": f"process_{int(time.time())}"
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error initiating data processing: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to initiate data processing: {str(e)}"
+        }
+
+@app.post("/process/sync", response_model=ApiResponse)
+async def process_data_sync(input_data: DataInput):
+    """Process data synchronously through the Kaleidoscope AI system."""
+    try:
+        # Process data directly
+        result = k_system.process_input(input_data.data, input_data.data_type)
+        
+        return {
+            "success": True,
+            "result": result
+        }
+    except Exception as e:
+        logger.error(f"Error processing data: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to process data: {str(e)}"
+        }
+
+@app.post("/evolve", response_model=ApiResponse)
+async def evolve_system(background_tasks: BackgroundTasks):
+    """Trigger system evolution in the background."""
+    try:
+        background_tasks.add_task(regenerate_system_background)
+        
+        return {
+            "success": True,
+            "message": "System evolution started in background",
+            "result": {
+                "task_id": f"evolve_{int(time.time())}"
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error initiating system evolution: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to initiate system evolution: {str(e)}"
+        }
+
+# Extension routes - Software Ingestion
+@app.post("/extensions/software/decompile", response_model=ApiResponse)
+async def decompile_binary(input_data: BinaryInput):
+    """Decompile a binary file to the specified language."""
+    try:
+        if not os.path.exists(input_data.binary_path):
+            return {
+                "success": False,
+                "error": f"Binary file not found: {input_data.binary_path}"
+            }
+        
+        result = k_extensions.decompile_binary(
+            binary_path=input_data.binary_path,
+            output_language=input_data.output_language,
+            analyze=input_data.analyze
+        )
+        
+        return {
+            "success": result.get("success", False),
+            "result": result
+        }
+    except Exception as e:
+        logger.error(f"Error decompiling binary: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to decompile binary: {str(e)}"
+        }
+
+@app.post("/extensions/software/patterns/{binary_hash}", response_model=ApiResponse)
+async def detect_code_patterns(binary_hash: str):
+    """Detect patterns in decompiled code."""
+    try:
+        result = k_extensions.detect_code_patterns(binary_hash)
+        
+        return {
+            "success": result.get("success", False),
+            "result": result
+        }
+    except Exception as e:
+        logger.error(f"Error detecting code patterns: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to detect code patterns: {str(e)}"
+        }
+
+@app.post("/extensions/software/reconstruct/{binary_hash}", response_model=ApiResponse)
+async def reconstruct_software(
+    binary_hash: str, 
+    language: str = Query("python"), 
+    enhance: bool = Query(True)
+):
+    """Reconstruct software from binary with enhancements."""
+    try:
+        result = k_extensions.reconstruct_software(
+            binary_hash=binary_hash,
+            language=language,
+            enhance=enhance
+        )
+        
+        return {
+            "success": result.get("success", False),
+            "result": result
+        }
+    except Exception as e:
+        logger.error(f"Error reconstructing software: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to reconstruct software: {str(e)}"
+        }
+
+# Extension routes - Drug Discovery
+@app.post("/extensions/drug/analyze", response_model=ApiResponse)
+async def analyze_molecule(input_data: MoleculeInput):
+    """Analyze a molecule's properties."""
+    try:
+        result = k_extensions.analyze_molecule(
+            molecule=input_data.molecule,
+            input_format=input_data.input_format
+        )
+        
+        return {
+            "success": result.get("success", False),
+            "result": result
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing molecule: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to analyze molecule: {str(e)}"
+        }
+
+@app.post("/extensions/drug/variants/{molecule_id}", response_model=ApiResponse)
+async def generate_molecular_variants(molecule_id: str, count: int = Query(5)):
+    """Generate variants of a molecule."""
+    try:
+        result = k_extensions.generate_molecular_variants(
+            molecule_id=molecule_id,
+            count=count
+        )
+        
+        return {
+            "success": result.get("success", False),
+            "result": result
+        }
+    except Exception as e:
+        logger.error(f"Error generating molecular variants: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to generate molecular variants: {str(e)}"
+        }
+
+@app.post("/extensions/drug/docking", response_model=ApiResponse)
+async def simulate_docking(input_data: DockingInput):
+    """Simulate molecular docking with a target protein."""
+    try:
+        result = k_extensions.simulate_docking(
+            molecule_id=input_data.molecule_id,
+            target=input_data.target,
+            exhaustiveness=input_data.exhaustiveness
+        )
+        
+        return {
+            "success": result.get("success", False),
+            "result": result
+        }
+    except Exception as e:
+        logger.error(f"Error simulating docking: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to simulate docking: {str(e)}"
+        }
+
+@app.post("/extensions/drug/interactions/{molecule_id}", response_model=ApiResponse)
+async def predict_interactions(
+    molecule_id: str, 
+    against_drugs: List[str] = Query(None)
+):
+    """Predict drug interactions."""
+    try:
+        result = k_extensions.predict_interactions(
+            molecule_id=molecule_id,
+            against_drugs=against_drugs
+        )
+        
+        return {
+            "success": result.get("success", False),
+            "result": result
+        }
+    except Exception as e:
+        logger.error(f"Error predicting interactions: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to predict interactions: {str(e)}"
+        }
+
+# Extension routes - Pattern Recognition
+@app.post("/extensions/patterns/analyze", response_model=ApiResponse)
+async def analyze_patterns(input_data: DataInput):
+    """Detect patterns in data."""
+    try:
+        result = k_extensions.analyze_patterns(
+            data=input_data.data,
+            data_type=input_data.data_type
+        )
+        
+        return {
+            "success": result.get("success", False),
+            "result": result
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing patterns: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to analyze patterns: {str(e)}"
+        }
+
+@app.post("/extensions/patterns/cross-domain", response_model=ApiResponse)
+async def find_cross_domain_insights(input_data: CrossDomainInput):
+    """Find patterns across multiple domains."""
+    try:
+        result = k_extensions.find_cross_domain_insights(input_data.domains)
+        
+        return {
+            "success": result.get("success", False),
+            "result": result
+        }
+    except Exception as e:
+        logger.error(f"Error finding cross-domain insights: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to find cross-domain insights: {str(e)}"
+        }
+
+# File upload handlers
+@app.post("/upload/binary", response_model=ApiResponse)
+async def upload_binary(file: UploadFile = File(...)):
+    """Upload a binary file for analysis."""
+    try:
+        # Create a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            # Write the uploaded file content
+            content = await file.read()
+            temp_file.write(content)
+            temp_path = temp_file.name
+        
+        return {
+            "success": True,
+            "message": f"File {file.filename} uploaded successfully",
+            "result": {
+                "filename": file.filename,
+                "size": len(content),
+                "path": temp_path
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error uploading binary: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to upload binary: {str(e)}"
+        }
+
+@app.post("/upload/molecule", response_model=ApiResponse)
+async def upload_molecule(
+    file: UploadFile = File(...),
+    format: str = Form("sdf")
+):
+    """Upload a molecule file for analysis."""
+    try:
+        content = await file.read()
+        
+        # Store the molecule file temporarily
+        molecule_dir = os.path.join(kaleidoscope_data_dir, "molecules")
+        os.makedirs(molecule_dir, exist_ok=True)
+        
+        file_path = os.path.join(molecule_dir, file.filename)
+        with open(file_path, "wb") as f:
+            f.write(content)
+        
+        # For demonstration purposes, we'll just read the file content
+        # In a real system, we'd use a library like RDKit to parse the molecule
+        
+        return {
+            "success": True,
+            "message": f"Molecule file {file.filename} uploaded successfully",
+            "result": {
+                "filename": file.filename,
+                "format": format,
+                "size": len(content),
+                "path": file_path
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error uploading molecule: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to upload molecule: {str(e)}"
+        }
+
+# Visualization endpoints
+@app.get("/visualize/cube", response_model=ApiResponse)
+async def get_cube_visualization():
+    """Get data for cube visualization."""
+    try:
+        visualization_data = k_system.cube.get_visualization_data()
+        
+        return {
+            "success": True,
+            "result": visualization_data
+        }
+    except Exception as e:
+        logger.error(f"Error getting cube visualization: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to get cube visualization: {str(e)}"
+        }
+
+@app.get("/visualize/network", response_model=ApiResponse)
+async def get_network_visualization():
+    """Get data for network visualization."""
+    try:
+        # Get the graph representation
+        G = k_system.cube.get_connection_graph()
+        
+        # Convert to JSON-serializable format
+        nodes = []
+        for node in G.nodes():
+            node_data = G.nodes[node]
+            nodes.append({
+                "id": node,
+                "domain": node_data.get("domain", "unknown"),
+                "position": node_data.get("position", [0, 0, 0])
+            })
+        
+        edges = []
+        for u, v, data in G.edges(data=True):
+            edges.append({
+                "source": u,
+                "target": v,
+                "weight": data.get("weight", 1.0)
+            })
+        
+        return {
+            "success": True,
+            "result": {
+                "nodes": nodes,
+                "edges": edges
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error getting network visualization: {str(e)}")
+        return {
+            "success": False,
+            "error": f"Failed to get network visualization: {str(e)}"
+        }
+
+# Serve static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Main startup function
+def start_api(host="0.0.0.0", port=8000):
+    """Start the Kaleidoscope API server."""
+    uvicorn.run(app, host=host, port=port)
+
+if __name__ == "__main__":
+    # Parse command line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description="Kaleidoscope AI API Server")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host address")
+    parser.add_argument("--port", type=int, default=8000, help="Port number")
+    args = parser.parse_args()
+    
+    # Start the API server
+    start_api(host=args.host, port=args.port)
